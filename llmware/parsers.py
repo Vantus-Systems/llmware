@@ -151,10 +151,15 @@ class Parser:
         self.parser_output = []
 
         self.ACCEPTED_FILE_FORMATS = ["pptx","xlsx","docx","pdf","txt","csv","html","jsonl",
-                                      "jpg","jpeg","png","wav","zip", "md", "tsv"]
+                                      "jpg","jpeg","png","wav","zip", "md", "tsv",
+                                      "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "cs", "java", "go",
+                                      "rs", "rb", "php", "scala", "swift", "kt", "sh", "bat", "ps1", "sql",
+                                      "css", "yaml", "yml", "xml"]
         self.office_types = ["PPTX", "pptx", "XLSX", "xlsx", "DOCX", "docx"]
         self.pdf_types = ["PDF", "pdf"]
         self.text_types = ["txt", "csv", "html", "jsonl", "md", "tsv"]
+        self.code_types = ["py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "cs", "java", "go", "rs", "rb",
+                           "php", "scala", "swift", "kt", "sh", "bat", "ps1", "sql", "css", "yaml", "yml", "xml"]
         self.ocr_types = ["jpg", "jpeg", "png"]
         self.voice_types = ["wav", "mp3", "mp4", "m4a"]
         self.zip_types = ["zip"]
@@ -342,6 +347,10 @@ class Parser:
 
             if filetype.lower() in self.text_types:
                 shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.text_work_folder,filename))
+                text_found += 1
+
+            if filetype.lower() in self.code_types:
+                shutil.copy(os.path.join(input_folder_path, filename), os.path.join(self.text_work_folder, filename))
                 text_found += 1
 
             if filetype.lower() in self.ocr_types:
@@ -589,6 +598,11 @@ class Parser:
                         if ext in self.text_types:
                             shutil.copy(os.path.join(self.zip_work_folder, "tmp" + os.sep, f),
                                         os.path.join(self.text_work_folder,fn))
+                            text_found += 1
+
+                        if ext in self.code_types:
+                            shutil.copy(os.path.join(self.zip_work_folder, "tmp" + os.sep, f),
+                                        os.path.join(self.text_work_folder, fn))
                             text_found += 1
 
                         if ext in self.ocr_types:
@@ -1266,11 +1280,12 @@ class Parser:
 
                 # sub-routing by type of text file to appropriate handler
 
-                if file_type.lower() in ["txt", "md"]:
+                if file_type.lower() in ["txt", "md"] or file_type.lower() in self.code_types:
                     # will parse as text
                     text_output = TextParser(self,text_chunk_size=text_chunk_size).text_file_handler (input_fp, file)
                     content_type = "text"
-                    file_type = "txt"
+                    if file_type.lower() not in self.code_types:
+                        file_type = "txt"
 
                 if file_type.lower() in ["csv", "tsv"]:
 
@@ -2867,16 +2882,17 @@ class Parser:
 
         file_type = input_fn.split(".")[-1].lower()
 
-        if file_type not in self.text_types:
+        if file_type not in self.text_types and file_type not in self.code_types:
             return output
 
         # sub-routing by type of text file to appropriate handler
 
-        if file_type in ["txt", "md"]:
+        if file_type in ["txt", "md"] or file_type in self.code_types:
             # will parse as text
             parser_output = TextParser(self).text_file_handler (input_fp, input_fn)
             content_type = "text"
-            file_type = "txt"
+            if file_type not in self.code_types:
+                file_type = "txt"
 
         if file_type.lower() in ["csv", "tsv"]:
             # will parse as table
