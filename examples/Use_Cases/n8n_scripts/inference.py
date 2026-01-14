@@ -15,7 +15,7 @@ except json.JSONDecodeError:
 
 # Select a model suitable for code planning
 # 'bling-phi-3-gguf' is a good local option
-model_name = "bling-phi-3-gguf"
+model_name = os.getenv("LLM_MODEL", "bling-phi-3-gguf")
 
 try:
     prompter = Prompt().load_model(model_name)

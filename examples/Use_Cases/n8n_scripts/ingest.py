@@ -35,8 +35,9 @@ try:
 
     # Using a small, fast model for demo purposes
     # In production, use 'nomic-embed-text-v1.5' or similar
-    print("Generating embeddings...")
-    lib.install_new_embedding(embedding_model_name="mini-lm-sbert", vector_db="chromadb")
+    embedding_model = os.getenv("EMBEDDING_MODEL", "mini-lm-sbert")
+    print(f"Generating embeddings with {embedding_model}...")
+    lib.install_new_embedding(embedding_model_name=embedding_model, vector_db="chromadb")
     print("Ingestion and Embedding Complete.")
 
 except Exception as e:

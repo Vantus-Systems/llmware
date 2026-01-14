@@ -1,0 +1,272 @@
+{
+  "name": "Advanced NextJS RAG Workflow (Self-Contained)",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Start",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "id": "1"
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "LIBRARY_NAME",
+              "value": "nextjs_rag_lib_advanced_{{ $execution.id }}"
+            },
+            {
+              "name": "SOURCE_PATH",
+              "value": "./tests/data/nextjs_project"
+            },
+            {
+              "name": "USER_QUERY",
+              "value": "How do I add a Login button component?"
+            },
+            {
+              "name": "EMBEDDING_MODEL",
+              "value": "mini-lm-sbert"
+            },
+            {
+              "name": "RERANKER_MODEL",
+              "value": "jina-reranker-tiny-onnx"
+            },
+            {
+              "name": "LLM_MODEL",
+              "value": "bling-phi-3-gguf"
+            }
+          ]
+        }
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [
+        300,
+        300
+      ],
+      "id": "2"
+    },
+    {
+      "parameters": {
+        "command": "mkdir -p /tmp/n8n_llmware_{{ $execution.id }}\ncat << 'EOF_INGEST_PY' > /tmp/n8n_llmware_{{ $execution.id }}/ingest.py\nimport os\nimport sys\nfrom llmware.library import Library\nfrom llmware.parsers import Parser\nfrom llmware.configs import LLMWareConfig\n\n# Configure SQLite/Chroma as default for the workflow\nLLMWareConfig().set_active_db(\"sqlite\")\nLLMWareConfig().set_vector_db(\"chromadb\")\n\n# Monkey-patching to ensure support even if library isn't fully updated in environment\ncode_extensions = [\"ts\", \"tsx\", \"js\", \"jsx\", \"css\", \"py\", \"json\", \"java\", \"cpp\", \"c\", \"h\", \"cs\", \"php\", \"rb\", \"go\", \"rs\", \"swift\", \"kt\"]\nfor ext in code_extensions:\n    if ext not in Parser.ACCEPTED_FILE_FORMATS:\n        Parser.ACCEPTED_FILE_FORMATS.append(ext)\n\n    # Check if code_types attr exists (it might not in older versions)\n    if hasattr(Parser, \"code_types\"):\n        if ext not in Parser.code_types:\n            Parser.code_types.append(ext)\n    else:\n        # Fallback: treat as text_types if code_types doesn't exist\n        if ext not in Parser.text_types:\n            Parser.text_types.append(ext)\n\nlib_name = os.getenv(\"LIBRARY_NAME\", \"nextjs_rag_lib\")\nsource_path = os.getenv(\"SOURCE_PATH\", \"./tests/data/nextjs_project\")\n\nprint(f\"Starting ingestion for library: {lib_name}\")\nprint(f\"Source path: {source_path}\")\n\ntry:\n    lib = Library().create_new_library(lib_name)\n    lib.add_files(input_folder_path=source_path)\n\n    # Using a small, fast model for demo purposes\n    # In production, use 'nomic-embed-text-v1.5' or similar\n    embedding_model = os.getenv(\"EMBEDDING_MODEL\", \"mini-lm-sbert\")\n    print(f\"Generating embeddings with {embedding_model}...\")\n    lib.install_new_embedding(embedding_model_name=embedding_model, vector_db=\"chromadb\")\n    print(\"Ingestion and Embedding Complete.\")\n\nexcept Exception as e:\n    print(f\"Error during ingestion: {e}\")\n    sys.exit(1)\n\nEOF_INGEST_PY\n\ncat << 'EOF_CLASSIFY_PY' > /tmp/n8n_llmware_{{ $execution.id }}/classify.py\nimport os\nimport json\nimport sys\nfrom llmware.models import ModelCatalog\n\nquery = os.getenv(\"USER_QUERY\", \"\")\n\nif not query:\n    print(json.dumps({\"error\": \"No query provided\"}))\n    sys.exit(1)\n\n# Using SLIM model for intent classification\n# In a Fortune-500 setup, this routes the query to different workflows\ntry:\n    classifier = ModelCatalog().load_model(\"slim-intent-tool\")\n    response = classifier.inference(query)\n\n    # Enrich the response\n    output = {\n        \"query\": query,\n        \"classification\": response,\n        \"intent\": \"coding_assistance\" # Simplified default for this demo\n    }\n\n    print(json.dumps(output))\n\nexcept Exception as e:\n    print(json.dumps({\"error\": str(e)}))\n    sys.exit(1)\n\nEOF_CLASSIFY_PY\n\ncat << 'EOF_SEARCH_PY' > /tmp/n8n_llmware_{{ $execution.id }}/search.py\nimport os\nimport json\nimport sys\nfrom llmware.library import Library\nfrom llmware.retrieval import Query\nfrom llmware.configs import LLMWareConfig\n\nLLMWareConfig().set_active_db(\"sqlite\")\nLLMWareConfig().set_vector_db(\"chromadb\")\n\nlib_name = os.getenv(\"LIBRARY_NAME\", \"nextjs_rag_lib\")\nquery = os.getenv(\"USER_QUERY\", \"\")\n\nif not query:\n    print(json.dumps([]))\n    sys.exit(0)\n\ntry:\n    lib = Library().load_library(lib_name)\n    q = Query(lib)\n\n    # Perform semantic search\n    results = q.semantic_query(query, result_count=15)\n\n    # Output results as JSON\n    print(json.dumps(results))\n\nexcept Exception as e:\n    # Output empty list on error to keep workflow running (or fail if strict)\n    print(json.dumps([]))\n    # print(str(e), file=sys.stderr)\n\nEOF_SEARCH_PY\n\ncat << 'EOF_RERANK_PY' > /tmp/n8n_llmware_{{ $execution.id }}/rerank.py\nimport os\nimport json\nimport sys\nfrom llmware.models import ModelCatalog\n\nquery = os.getenv(\"USER_QUERY\", \"\")\n\n# Read search results from stdin\ninput_data = sys.stdin.read()\n\ntry:\n    results = json.loads(input_data)\nexcept json.JSONDecodeError:\n    # If no valid JSON, return empty list\n    print(json.dumps([]))\n    sys.exit(0)\n\nif not results or not query:\n    print(json.dumps(results))\n    sys.exit(0)\n\ntry:\n    # Use a small, efficient reranker\n    model_name = os.getenv(\"RERANKER_MODEL\", \"jina-reranker-tiny-onnx\")\n    reranker = ModelCatalog().load_model(model_name)\n\n    # Reranker inference: (query, list_of_contexts)\n    # Contexts can be dicts or strings. llmware handles dicts if they have 'text' key.\n    ranked_results = reranker.inference(query, results)\n\n    # Sort by 'rerank_score' descending\n    ranked_results.sort(key=lambda x: x.get(\"rerank_score\", 0), reverse=True)\n\n    # Return top 5\n    print(json.dumps(ranked_results[:5]))\n\nexcept Exception as e:\n    # Fallback: return original results if reranking fails\n    # print(f\"Rerank failed: {e}\", file=sys.stderr)\n    print(json.dumps(results[:5]))\n\nEOF_RERANK_PY\n\ncat << 'EOF_INFERENCE_PY' > /tmp/n8n_llmware_{{ $execution.id }}/inference.py\nimport os\nimport json\nimport sys\nfrom llmware.prompts import Prompt\n\nquery = os.getenv(\"USER_QUERY\", \"\")\n\n# Read context from stdin\ninput_data = sys.stdin.read()\n\ntry:\n    context_list = json.loads(input_data)\nexcept json.JSONDecodeError:\n    context_list = []\n\n# Select a model suitable for code planning\n# 'bling-phi-3-gguf' is a good local option\nmodel_name = os.getenv(\"LLM_MODEL\", \"bling-phi-3-gguf\")\n\ntry:\n    prompter = Prompt().load_model(model_name)\n\n    # Add context\n    prompter.add_source_query_results(context_list)\n\n    system_instruction = (\n        \"You are a Senior Software Engineer specializing in Next.js 16, React 19, and Tailwind CSS. \"\n        \"Create a production-ready feature implementation plan based on the user request. \"\n        \"Focus on best practices.\"\n    )\n\n    full_prompt = f\"{system_instruction}\\n\\nUser Request: {query}\"\n\n    response = prompter.prompt_with_source(full_prompt)\n\n    # Output the structured response\n    print(json.dumps(response))\n\nexcept Exception as e:\n    print(json.dumps({\"error\": str(e)}))\n\nEOF_INFERENCE_PY\n\n"
+      },
+      "name": "Setup Scripts",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ],
+      "id": "3"
+    },
+    {
+      "parameters": {
+        "command": "export PYTHONPATH=$PYTHONPATH:.\nexport LIBRARY_NAME=\"{{ $('Config').item.json.LIBRARY_NAME }}\"\nexport SOURCE_PATH=\"{{ $('Config').item.json.SOURCE_PATH }}\"\nexport EMBEDDING_MODEL=\"{{ $('Config').item.json.EMBEDDING_MODEL }}\"\npython3 /tmp/n8n_llmware_{{ $execution.id }}/ingest.py"
+      },
+      "name": "Ingest",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        700,
+        300
+      ],
+      "id": "4"
+    },
+    {
+      "parameters": {
+        "command": "export PYTHONPATH=$PYTHONPATH:.\nexport USER_QUERY=\"{{ $('Config').item.json.USER_QUERY }}\"\npython3 /tmp/n8n_llmware_{{ $execution.id }}/classify.py"
+      },
+      "name": "Classify",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        900,
+        300
+      ],
+      "id": "5"
+    },
+    {
+      "parameters": {
+        "command": "export PYTHONPATH=$PYTHONPATH:.\nexport LIBRARY_NAME=\"{{ $('Config').item.json.LIBRARY_NAME }}\"\nexport USER_QUERY=\"{{ $('Config').item.json.USER_QUERY }}\"\npython3 /tmp/n8n_llmware_{{ $execution.id }}/search.py"
+      },
+      "name": "Search",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        300
+      ],
+      "id": "6"
+    },
+    {
+      "parameters": {
+        "command": "export PYTHONPATH=$PYTHONPATH:.\nexport USER_QUERY=\"{{ $('Config').item.json.USER_QUERY }}\"\nexport RERANKER_MODEL=\"{{ $('Config').item.json.RERANKER_MODEL }}\"\necho '{{ JSON.stringify($json).replace(/'/g, \"'\\\\''\") }}' | python3 /tmp/n8n_llmware_{{ $execution.id }}/rerank.py"
+      },
+      "name": "Rerank",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        300
+      ],
+      "id": "7"
+    },
+    {
+      "parameters": {
+        "command": "export PYTHONPATH=$PYTHONPATH:.\nexport USER_QUERY=\"{{ $('Config').item.json.USER_QUERY }}\"\nexport LLM_MODEL=\"{{ $('Config').item.json.LLM_MODEL }}\"\necho '{{ JSON.stringify($json).replace(/'/g, \"'\\\\''\") }}' | python3 /tmp/n8n_llmware_{{ $execution.id }}/inference.py"
+      },
+      "name": "Inference",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        300
+      ],
+      "id": "8"
+    },
+    {
+      "parameters": {
+        "command": "rm -rf /tmp/n8n_llmware_{{ $execution.id }}"
+      },
+      "name": "Cleanup",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1700,
+        300
+      ],
+      "id": "9"
+    },
+    {
+      "parameters": {},
+      "name": "Error Catch",
+      "type": "n8n-nodes-base.catch",
+      "typeVersion": 1,
+      "position": [
+        900,
+        600
+      ],
+      "id": "10"
+    },
+    {
+      "parameters": {
+        "command": "rm -rf /tmp/n8n_llmware_{{ $execution.id }}"
+      },
+      "name": "Cleanup on Error",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        600
+      ],
+      "id": "11"
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Setup Scripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Setup Scripts": {
+      "main": [
+        [
+          {
+            "node": "Ingest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingest": {
+      "main": [
+        [
+          {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify": {
+      "main": [
+        [
+          {
+            "node": "Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search": {
+      "main": [
+        [
+          {
+            "node": "Rerank",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rerank": {
+      "main": [
+        [
+          {
+            "node": "Inference",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inference": {
+      "main": [
+        [
+          {
+            "node": "Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Catch": {
+      "main": [
+        [
+          {
+            "node": "Cleanup on Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
