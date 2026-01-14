@@ -21,7 +21,8 @@ if not results or not query:
 
 try:
     # Use a small, efficient reranker
-    reranker = ModelCatalog().load_model("jina-reranker-tiny-onnx")
+    model_name = os.getenv("RERANKER_MODEL", "jina-reranker-tiny-onnx")
+    reranker = ModelCatalog().load_model(model_name)
 
     # Reranker inference: (query, list_of_contexts)
     # Contexts can be dicts or strings. llmware handles dicts if they have 'text' key.
