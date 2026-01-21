@@ -30,9 +30,12 @@ import csv
 import os
 import sqlite3
 import json
+import concurrent.futures
 
 from llmware.models import ModelCatalog, _ModelRegistry
 from llmware.util import CorpTokenizer, AgentWriter
+from llmware.retrieval import Query
+from llmware.prompts import Prompt
 from llmware.configs import SQLiteConfig
 from llmware.exceptions import ModelNotFoundException
 from llmware.resources import CustomTable
@@ -1673,6 +1676,159 @@ class SQLTables:
         return 0
 
 
+class RecursiveAgent:
+
+    """ RecursiveAgent implements the 'Recursive Language Model' pattern with unconventional strategies:
+        1. Map-Reduce Swarm
+        2. Neural Peeking
+        3. Dynamic Context Mutation
+        4. Fine-Tuned Controller / Reader Separation
+    """
+
+    def __init__(self, library, controller_model, reader_model=None, embedding_model=None, verbose=True):
+        self.library = library
+        self.controller_model = controller_model
+        self.reader_model = reader_model if reader_model else controller_model
+        self.embedding_model = embedding_model
+        self.verbose = verbose
+        self.context = {}  # Dynamic context memory
+
+        # Initialize Query object for Neural Peeking
+        self.query_engine = Query(self.library, embedding_model=self.embedding_model)
+
+        # Initialize Prompt objects
+        self.controller = Prompt().load_model(self.controller_model)
+        if self.reader_model != self.controller_model:
+            self.reader = Prompt().load_model(self.reader_model)
+        else:
+            self.reader = self.controller
+
+    def neural_peek(self, query, top_n=5):
+        """ Strategy 2: Neural Peeking (Semantic Search) """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Peeking: {query}")
+
+        results = self.query_engine.semantic_query(query, result_count=top_n)
+        return [r['text'] for r in results]
+
+    def map_reduce(self, task, chunks):
+        """ Strategy 1: Map-Reduce Swarm (Parallel Asynchrony) """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Map-Reduce on {len(chunks)} chunks: {task}")
+
+        # Note: Using Prompt inside threads requires careful state management.
+        # We instantiate a new Prompt for each thread to avoid shared state issues.
+
+        # Capture model name for thread-local instantiation
+        reader_model_name = self.reader_model
+
+        def process_chunk(chunk):
+            # Instantiate thread-local Prompt to avoid shared state corruption
+            local_reader = Prompt().load_model(reader_model_name)
+            response = local_reader.prompt_main(task, context=chunk)
+            return response['llm_response']
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(process_chunk, chunks))
+
+        # Reduce: Synthesize results
+        synthesis_prompt = f"Synthesize the following results for the task '{task}':\n" + "\n".join(results)
+        final_response = self.reader.prompt_main(synthesis_prompt)
+        return final_response['llm_response']
+
+    def mutate_context(self, instruction):
+        """ Strategy 3: Dynamic Context Mutation """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Mutating Context: {instruction}")
+
+        # Simple implementation: Let the Reader process the instruction against the current context
+        context_str = json.dumps(self.context, indent=2)
+        mutation_prompt = f"Current Context: {context_str}\n\nInstruction: {instruction}\n\nOutput the new context as a valid JSON string."
+
+        response = self.controller.prompt_main(mutation_prompt) # Controller handles logic/structure
+        try:
+            # Extract JSON
+            new_context_str = response['llm_response']
+            # Try to find JSON block
+            if "```json" in new_context_str:
+                new_context_str = new_context_str.split("```json")[1].split("```")[0]
+            elif "{" in new_context_str:
+                new_context_str = new_context_str[new_context_str.find("{"):new_context_str.rfind("}")+1]
+
+            self.context = json.loads(new_context_str)
+            if self.verbose:
+                logger.info(f"[RecursiveAgent] Context Updated. Keys: {list(self.context.keys())}")
+        except Exception as e:
+            logger.info(f"[RecursiveAgent] Context Mutation Failed: {e}")
+
+    def run(self, task, initial_context=None):
+        """ Main Loop (Controller) """
+        if initial_context:
+            self.context = initial_context
+
+        max_steps = 10
+        step = 0
+
+        while step < max_steps:
+            step += 1
+
+            # Construct Prompt for Controller
+            context_keys = list(self.context.keys())
+            prompt = (
+                f"Task: {task}\n"
+                f"Current Context Keys: {context_keys}\n"
+                f"Available Tools:\n"
+                f"1. PEEK(query) - Search for information.\n"
+                f"2. MAP_REDUCE(sub_task, list_key) - Process a list of items in parallel.\n"
+                f"3. MUTATE(instruction) - Edit context memory.\n"
+                f"4. ANSWER(text) - Final answer.\n"
+                f"Respond with a single tool call."
+            )
+
+            response = self.controller.prompt_main(prompt)['llm_response'].strip()
+            if self.verbose:
+                logger.info(f"[RecursiveAgent] Step {step} Action: {response}")
+
+            if response.startswith("ANSWER"):
+                if "(" in response and response.endswith(")"):
+                     return response.split("(", 1)[1].rsplit(")", 1)[0].strip('"\'')
+                return response
+
+            # Parse and Execute
+            match = re.match(r"(\w+)\s*\((.*)\)", response, re.DOTALL)
+            if match:
+                cmd, args = match.groups()
+                args = args.strip()
+
+                if cmd == "PEEK":
+                    # Neural Peek
+                    query = args.strip('"').strip("'")
+                    chunks = self.neural_peek(query)
+                    self.context[f"peek_{step}"] = chunks # Store results
+
+                elif cmd == "MAP_REDUCE":
+                    # Parse args: "sub_task", "list_key"
+                    parts = [p.strip().strip('"').strip("'") for p in args.split(",")]
+                    if len(parts) >= 2:
+                        sub_task = parts[0]
+                        list_key = parts[1]
+
+                        if list_key in self.context and isinstance(self.context[list_key], list):
+                            result = self.map_reduce(sub_task, self.context[list_key])
+                            self.context[f"map_reduce_{step}"] = result
+                        else:
+                            logger.info(f"[RecursiveAgent] Key {list_key} not found or not a list.")
+                    else:
+                         logger.info(f"[RecursiveAgent] MAP_REDUCE requires 2 arguments.")
+
+                elif cmd == "MUTATE":
+                    instruction = args.strip('"').strip("'")
+                    self.mutate_context(instruction)
+            else:
+                if self.verbose:
+                    logger.info(f"[RecursiveAgent] Unrecognized command format.")
+
+        return "Max steps reached."
 
 
 
