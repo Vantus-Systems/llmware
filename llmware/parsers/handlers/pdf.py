@@ -11,6 +11,7 @@ from llmware.configs import LLMWareConfig
 from llmware.parsers.handlers.base import BaseHandler
 from llmware.parsers.records import Block
 from llmware.parsers.bindings import ParserBindings, DebugMode, ImageSaveMode, EncodingStyle, TableExtractMode
+from llmware.parsers.utils import process_parser_output
 from llmware.exceptions import FilePathDoesNotExistException, LLMWareException
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,11 @@ class PDFHandler(BaseHandler):
         # Process output file
         output_file_path = parser_tmp_folder / write_to_filename
 
-        blocks = self._process_parser_output(output_file_path)
+        blocks = process_parser_output(output_file_path)
+
+        # Update file_type if needed (util sets to 'unknown')
+        for b in blocks:
+            b.file_type = "pdf"
 
         # Cleanup
         try:
@@ -177,114 +182,5 @@ class PDFHandler(BaseHandler):
                 output_file_path.unlink()
         except OSError as e:
             logger.warning(f"Could not delete temp file {output_file_path}: {e}")
-
-        return blocks
-
-    def _process_parser_output(self, file_path: Path) -> List[Block]:
-        """Reads the text file output from C parser and converts to Blocks."""
-
-        if not file_path.exists():
-            logger.warning(f"Parser output file not found: {file_path}")
-            return []
-
-        default_keys = [
-            "block_ID", "doc_ID", "content_type", "file_type", "master_index", "master_index2",
-            "coords_x", "coords_y", "coords_cx", "coords_cy", "author_or_speaker", "modified_date",
-            "created_date", "creator_tool", "added_to_collection", "file_source",
-            "table", "external_files", "text", "header_text", "text_search",
-            "user_tags", "special_field1", "special_field2", "special_field3", "graph_status", "dialog"
-        ]
-
-        blocks: List[Block] = []
-
-        try:
-            with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
-                content = f.read()
-        except Exception as e:
-            logger.error(f"Error reading parser output file: {e}")
-            return []
-
-        # Split by the C-parser defined delimiter
-        raw_blocks = content.split("<END_BLOCK>\n")
-
-        for raw_block in raw_blocks:
-            if not raw_block.strip():
-                continue
-
-            block_data = {}
-            lines = raw_block.split("\n<")
-
-            for line in lines:
-                for key in default_keys:
-                    key_marker = f"{key}>: "
-                    # Check if line starts with key marker (handling the first line which might not have \n< prefix effectively in split)
-                    # The split removed \n<, so lines usually start with KEY>:
-                    # But the first line of raw_block might be just KEY>: if it was at start of file?
-                    # The original parser code: entries.startswith(key_string)
-
-                    if line.startswith(key_marker) or line.startswith(f"<{key_marker}"):
-                        # Clean up the key marker
-                        clean_marker = key_marker
-                        if line.startswith("<"):
-                             clean_marker = f"<{key_marker}"
-
-                        value = line[len(clean_marker):].strip()
-                        if value.endswith(","):
-                            value = value[:-1]
-
-                        block_data[key] = value
-                        break
-
-            # Map to Block dataclass
-            if "text" in block_data:
-                # Convert numeric fields
-                try:
-                    doc_id = int(block_data.get("doc_ID", 0))
-                except: doc_id = 0
-
-                try:
-                    block_id = int(block_data.get("block_ID", 0))
-                except: block_id = 0
-
-                try:
-                    coords_x = int(block_data.get("coords_x", 0))
-                except: coords_x = 0
-
-                try:
-                    coords_y = int(block_data.get("coords_y", 0))
-                except: coords_y = 0
-
-                # ... map other fields ...
-
-                block = Block(
-                    text=block_data.get("text", ""),
-                    doc_id=doc_id,
-                    block_id=block_id,
-                    file_source=block_data.get("file_source", ""),
-                    content_type=block_data.get("content_type", "text"),
-                    file_type=block_data.get("file_type", "pdf"),
-                    master_index=int(block_data.get("master_index", 0)) if block_data.get("master_index", "").isdigit() else 0,
-                    master_index2=int(block_data.get("master_index2", 0)) if block_data.get("master_index2", "").isdigit() else 0,
-                    coords_x=coords_x,
-                    coords_y=coords_y,
-                    coords_cx=int(block_data.get("coords_cx", 0)) if block_data.get("coords_cx", "").isdigit() else 0,
-                    coords_cy=int(block_data.get("coords_cy", 0)) if block_data.get("coords_cy", "").isdigit() else 0,
-                    author_or_speaker=block_data.get("author_or_speaker", ""),
-                    modified_date=block_data.get("modified_date", ""),
-                    created_date=block_data.get("created_date", ""),
-                    creator_tool=block_data.get("creator_tool", ""),
-                    added_to_collection=block_data.get("added_to_collection", ""),
-                    table=block_data.get("table", ""),
-                    external_files=block_data.get("external_files", ""),
-                    header_text=block_data.get("header_text", ""),
-                    text_search=block_data.get("text_search", ""),
-                    user_tags=block_data.get("user_tags", ""),
-                    special_field1=block_data.get("special_field1", ""),
-                    special_field2=block_data.get("special_field2", ""),
-                    special_field3=block_data.get("special_field3", ""),
-                    graph_status=block_data.get("graph_status", "false"),
-                    dialog=block_data.get("dialog", "false")
-                )
-                blocks.append(block)
 
         return blocks

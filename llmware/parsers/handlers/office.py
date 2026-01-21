@@ -10,6 +10,7 @@ from llmware.configs import LLMWareConfig
 from llmware.parsers.handlers.base import BaseHandler
 from llmware.parsers.records import Block
 from llmware.parsers.bindings import ParserBindings, DebugMode, ImageSaveMode, EncodingStyle, TableExtractMode
+from llmware.parsers.utils import process_parser_output
 from llmware.exceptions import FilePathDoesNotExistException, LLMWareException
 
 logger = logging.getLogger(__name__)
@@ -132,89 +133,16 @@ class OfficeHandler(BaseHandler):
 
         output_file_path = parser_tmp_folder / write_to_filename
 
-        # Reuse PDF output processor as structure is identical
-        from llmware.parsers.handlers.pdf import PDFHandler
-        # Hacky but effective reuse of private method since format is identical
-        # Better: move _process_parser_output to base or util
-        # I'll convert it to a util method in base or standalone
+        blocks = process_parser_output(output_file_path)
 
-        # For now, I'll instantiate a dummy PDFHandler or copy the logic.
-        # Since I am refactoring, I should put it in BaseHandler or utils.
-        # I'll assume I can duplicate for speed or I should have put it in Base.
-
-        blocks = self._process_parser_output(output_file_path)
+        # Update file_type
+        for b in blocks:
+            b.file_type = "office"
 
         try:
             if output_file_path.exists():
                 output_file_path.unlink()
-        except:
-            pass
-
-        return blocks
-
-    def _process_parser_output(self, file_path: Path) -> List[Block]:
-        # Duplicate of PDFHandler._process_parser_output logic
-        # (Ideal refactor: move to shared util)
-
-        if not file_path.exists():
-            return []
-
-        default_keys = [
-            "block_ID", "doc_ID", "content_type", "file_type", "master_index", "master_index2",
-            "coords_x", "coords_y", "coords_cx", "coords_cy", "author_or_speaker", "modified_date",
-            "created_date", "creator_tool", "added_to_collection", "file_source",
-            "table", "external_files", "text", "header_text", "text_search",
-            "user_tags", "special_field1", "special_field2", "special_field3", "graph_status", "dialog"
-        ]
-
-        blocks: List[Block] = []
-
-        try:
-            with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
-                content = f.read()
-        except:
-            return []
-
-        raw_blocks = content.split("<END_BLOCK>\n")
-
-        for raw_block in raw_blocks:
-            if not raw_block.strip():
-                continue
-
-            block_data = {}
-            lines = raw_block.split("\n<")
-
-            for line in lines:
-                for key in default_keys:
-                    key_marker = f"{key}>: "
-                    if line.startswith(key_marker) or line.startswith(f"<{key_marker}"):
-                        clean_marker = key_marker
-                        if line.startswith("<"):
-                             clean_marker = f"<{key_marker}"
-                        value = line[len(clean_marker):].strip()
-                        if value.endswith(","): value = value[:-1]
-                        block_data[key] = value
-                        break
-
-            if "text" in block_data:
-                # Helper for int conversion
-                def get_int(k):
-                    try: return int(block_data.get(k, 0))
-                    except: return 0
-
-                block = Block(
-                    text=block_data.get("text", ""),
-                    doc_id=get_int("doc_ID"),
-                    block_id=get_int("block_ID"),
-                    file_source=block_data.get("file_source", ""),
-                    content_type=block_data.get("content_type", "text"),
-                    file_type=block_data.get("file_type", "office"),
-                    master_index=get_int("master_index"),
-                    coords_x=get_int("coords_x"),
-                    coords_y=get_int("coords_y"),
-                    author_or_speaker=block_data.get("author_or_speaker", ""),
-                    # ... add others as needed
-                )
-                blocks.append(block)
+        except OSError as e:
+            logger.warning(f"Could not delete temp file {output_file_path}: {e}")
 
         return blocks

@@ -1,11 +1,12 @@
 
 import Link from 'next/link'
 import { cn } from '@/lib/utils'
-import { LayoutDashboard, MessageSquare, Settings, FileText } from 'lucide-react'
+import { LayoutDashboard, MessageSquare, Settings, FileText, PieChart } from 'lucide-react'
 
 const navItems = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Chat Assistant', href: '/chat', icon: MessageSquare },
+  { name: 'Analytics', href: '/analytics', icon: PieChart },
   { name: 'Documents', href: '/documents', icon: FileText },
   { name: 'Settings', href: '/settings', icon: Settings },
 ]
