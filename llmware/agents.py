@@ -30,9 +30,13 @@ import csv
 import os
 import sqlite3
 import json
+import concurrent.futures
+import threading
 
 from llmware.models import ModelCatalog, _ModelRegistry
 from llmware.util import CorpTokenizer, AgentWriter
+from llmware.retrieval import Query
+from llmware.prompts import Prompt
 from llmware.configs import SQLiteConfig
 from llmware.exceptions import ModelNotFoundException
 from llmware.resources import CustomTable
@@ -1673,6 +1677,261 @@ class SQLTables:
         return 0
 
 
+class RecursiveAgent:
+
+    """ RecursiveAgent implements the 'Recursive Language Model' pattern with unconventional strategies:
+        1. Map-Reduce Swarm
+        2. Neural Peeking
+        3. Dynamic Context Mutation
+        4. Fine-Tuned Controller / Reader Separation
+    """
+
+    def __init__(self, library, controller_model, reader_model=None, embedding_model=None, verbose=True, recursion_depth=0):
+        self.library = library
+        self.controller_model = controller_model
+        self.reader_model = reader_model if reader_model else controller_model
+        self.embedding_model = embedding_model
+        self.verbose = verbose
+        self.recursion_depth = recursion_depth
+        self.context = {}  # Dynamic context memory
+        self.reader_lock = threading.Lock()
+
+        # Initialize Query object for Neural Peeking
+        self.query_engine = Query(self.library, embedding_model=self.embedding_model)
+
+        # Initialize Prompt objects
+        self.controller = Prompt().load_model(self.controller_model)
+        if self.reader_model != self.controller_model:
+            self.reader = Prompt().load_model(self.reader_model)
+        else:
+            self.reader = self.controller
+
+    def neural_peek(self, query, top_n=5):
+        """ Strategy 2: Neural Peeking (Semantic Search) """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Peeking: {query}")
+
+        results = self.query_engine.semantic_query(query, result_count=top_n)
+        return [r['text'] for r in results]
+
+    def map_reduce(self, task, chunks):
+        """ Strategy 1: Map-Reduce Swarm (Parallel Asynchrony) """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Map-Reduce on {len(chunks)} chunks: {task}")
+
+        # Capture model name for thread-local instantiation to allow parallelism
+        reader_model_name = self.reader_model
+
+        def process_chunk(chunk):
+            # Instantiate thread-local Prompt to allow true parallelism for API models.
+            # For local models, this might be heavy, but it avoids the global lock bottleneck.
+            # In a production environment, this should be backed by a model serving pool.
+            try:
+                local_reader = Prompt().load_model(reader_model_name)
+                response = local_reader.prompt_main(task, context=chunk)
+                return response['llm_response']
+            except Exception as e:
+                logger.error(f"[RecursiveAgent] Map-Reduce chunk failed: {e}")
+                return f"Error processing chunk: {e}"
+
+        # Use ThreadPoolExecutor for concurrency
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(process_chunk, chunks))
+
+        # Reduce: Synthesize results
+        synthesis_prompt = f"Synthesize the following results for the task '{task}':\n" + "\n".join(results)
+        final_response = self.reader.prompt_main(synthesis_prompt)
+        return final_response['llm_response']
+
+    def mutate_context(self, instruction):
+        """ Strategy 3: Dynamic Context Mutation - Rewriting the full context. """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Mutating Context: {instruction}")
+
+        # Simple implementation: Let the Reader process the instruction against the current context
+        context_str = json.dumps(self.context, indent=2)
+        mutation_prompt = f"Current Context: {context_str}\n\nInstruction: {instruction}\n\nOutput the new context as a valid JSON string."
+
+        response = self.controller.prompt_main(mutation_prompt) # Controller handles logic/structure
+        try:
+            # Extract JSON
+            new_context_str = response['llm_response']
+            # Try to find JSON block
+            if "```json" in new_context_str:
+                new_context_str = new_context_str.split("```json")[1].split("```")[0]
+            elif "{" in new_context_str:
+                new_context_str = new_context_str[new_context_str.find("{"):new_context_str.rfind("}")+1]
+
+            self.context = json.loads(new_context_str)
+            if self.verbose:
+                logger.info(f"[RecursiveAgent] Context Updated. Keys: {list(self.context.keys())}")
+        except Exception as e:
+            logger.info(f"[RecursiveAgent] Context Mutation Failed: {e}")
+
+    def update_context_granular(self, key, value, operation="set"):
+        """ Granular Context Mutation: set or delete specific keys. """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Granular Update: {operation} key='{key}'")
+
+        if operation == "set":
+            self.context[key] = value
+        elif operation == "delete":
+            if key in self.context:
+                del self.context[key]
+
+    def spawn_sub_agent(self, task, context_keys):
+        """ Spawns a new RecursiveAgent for a sub-task. """
+        if self.recursion_depth >= 3:
+            logger.warning("[RecursiveAgent] Max recursion depth reached. Cannot spawn sub-agent.")
+            return "Error: Max recursion depth reached."
+
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Spawning Sub-Agent (Depth {self.recursion_depth + 1}): task='{task}', keys={context_keys}")
+
+        sub_context = {k: self.context[k] for k in context_keys if k in self.context}
+
+        # Instantiate sub-agent with same configuration but incremented depth
+        sub_agent = RecursiveAgent(
+            self.library,
+            self.controller_model,
+            reader_model=self.reader_model,
+            embedding_model=self.embedding_model,
+            verbose=self.verbose,
+            recursion_depth=self.recursion_depth + 1
+        )
+
+        return sub_agent.run(task, initial_context=sub_context)
+
+    def _parse_args_robust(self, args_str):
+        """
+        Robust argument parsing handling quotes, commas within quotes, newlines, and JSON blocks.
+        Returns a list of parsed arguments.
+        """
+        args = []
+        current_arg = []
+        in_quote = False
+        quote_char = None
+        escape = False
+
+        for char in args_str:
+            if escape:
+                current_arg.append(char)
+                escape = False
+                continue
+
+            if char == '\\':
+                escape = True
+                continue
+
+            if in_quote:
+                if char == quote_char:
+                    in_quote = False
+                    quote_char = None
+                else:
+                    current_arg.append(char)
+            else:
+                if char in ['"', "'"]:
+                    in_quote = True
+                    quote_char = char
+                elif char == ',':
+                    args.append("".join(current_arg).strip())
+                    current_arg = []
+                else:
+                    current_arg.append(char)
+
+        if current_arg:
+            args.append("".join(current_arg).strip())
+
+        return args
+
+    def run(self, task, initial_context=None, max_steps=10):
+        """ Main Loop (Controller) """
+        if initial_context:
+            self.context = initial_context
+
+        step = 0
+
+        while step < max_steps:
+            step += 1
+
+            # Construct Prompt for Controller
+            context_keys = list(self.context.keys())
+            prompt = (
+                f"Task: {task}\n"
+                f"Current Context Keys: {context_keys}\n"
+                f"Available Tools:\n"
+                f"1. PEEK(query) - Semantic search for information.\n"
+                f"2. MAP_REDUCE(sub_task, list_key) - Parallel processing of a list.\n"
+                f"3. SET(key, value) - Store or update a value in context.\n"
+                f"4. DELETE(key) - Remove a key from context.\n"
+                f"5. SUB_AGENT(task, key1, key2...) - Spawn recursive agent with specific context keys.\n"
+                f"6. MUTATE(instruction) - Rewrite or optimize context memory.\n"
+                f"7. ANSWER(text) - Final answer.\n"
+                f"Respond with a single tool call command."
+            )
+
+            response = self.controller.prompt_main(prompt)['llm_response'].strip()
+            if self.verbose:
+                logger.info(f"[RecursiveAgent] Step {step} Action: {response}")
+
+            if response.startswith("ANSWER"):
+                if "(" in response and response.endswith(")"):
+                     # Simple parsing for single argument answer
+                     return response.split("(", 1)[1].rsplit(")", 1)[0].strip('"\'')
+                return response
+
+            # Parse and Execute
+            # Use search instead of match to be more robust to chatty models
+            match = re.search(r"(\w+)\s*\((.*)\)", response, re.DOTALL)
+            if match:
+                cmd, args_str = match.groups()
+                args = self._parse_args_robust(args_str)
+
+                if cmd == "PEEK":
+                    if args:
+                        query = args[0]
+                        chunks = self.neural_peek(query)
+                        self.context[f"peek_step_{step}"] = chunks
+
+                elif cmd == "MAP_REDUCE":
+                    if len(args) >= 2:
+                        sub_task = args[0]
+                        list_key = args[1]
+
+                        if list_key in self.context and isinstance(self.context[list_key], list):
+                            result = self.map_reduce(sub_task, self.context[list_key])
+                            self.context[f"map_reduce_step_{step}"] = result
+                        else:
+                            logger.info(f"[RecursiveAgent] MAP_REDUCE: Key {list_key} not found or not a list.")
+
+                elif cmd == "SET":
+                    if len(args) >= 2:
+                        key = args[0]
+                        value = args[1]
+                        self.update_context_granular(key, value, "set")
+
+                elif cmd == "DELETE":
+                    if len(args) >= 1:
+                        key = args[0]
+                        self.update_context_granular(key, None, "delete")
+
+                elif cmd == "SUB_AGENT":
+                    if len(args) >= 2:
+                        sub_task = args[0]
+                        keys_to_pass = args[1:]
+                        result = self.spawn_sub_agent(sub_task, keys_to_pass)
+                        self.context[f"sub_agent_step_{step}"] = result
+
+                elif cmd == "MUTATE":
+                    # Backwards compatibility / full rewrite strategy
+                    if args:
+                        instruction = args[0]
+                        self.mutate_context(instruction)
+            else:
+                if self.verbose:
+                    logger.info(f"[RecursiveAgent] Unrecognized command format: {response}")
+
+        return "Max steps reached."
 
 
 
