@@ -31,6 +31,7 @@ import os
 import sqlite3
 import json
 import concurrent.futures
+import threading
 
 from llmware.models import ModelCatalog, _ModelRegistry
 from llmware.util import CorpTokenizer, AgentWriter
@@ -1685,13 +1686,15 @@ class RecursiveAgent:
         4. Fine-Tuned Controller / Reader Separation
     """
 
-    def __init__(self, library, controller_model, reader_model=None, embedding_model=None, verbose=True):
+    def __init__(self, library, controller_model, reader_model=None, embedding_model=None, verbose=True, recursion_depth=0):
         self.library = library
         self.controller_model = controller_model
         self.reader_model = reader_model if reader_model else controller_model
         self.embedding_model = embedding_model
         self.verbose = verbose
+        self.recursion_depth = recursion_depth
         self.context = {}  # Dynamic context memory
+        self.reader_lock = threading.Lock()
 
         # Initialize Query object for Neural Peeking
         self.query_engine = Query(self.library, embedding_model=self.embedding_model)
@@ -1716,18 +1719,22 @@ class RecursiveAgent:
         if self.verbose:
             logger.info(f"[RecursiveAgent] Map-Reduce on {len(chunks)} chunks: {task}")
 
-        # Note: Using Prompt inside threads requires careful state management.
-        # We instantiate a new Prompt for each thread to avoid shared state issues.
-
-        # Capture model name for thread-local instantiation
+        # Capture model name for thread-local instantiation to allow parallelism
         reader_model_name = self.reader_model
 
         def process_chunk(chunk):
-            # Instantiate thread-local Prompt to avoid shared state corruption
-            local_reader = Prompt().load_model(reader_model_name)
-            response = local_reader.prompt_main(task, context=chunk)
-            return response['llm_response']
+            # Instantiate thread-local Prompt to allow true parallelism for API models.
+            # For local models, this might be heavy, but it avoids the global lock bottleneck.
+            # In a production environment, this should be backed by a model serving pool.
+            try:
+                local_reader = Prompt().load_model(reader_model_name)
+                response = local_reader.prompt_main(task, context=chunk)
+                return response['llm_response']
+            except Exception as e:
+                logger.error(f"[RecursiveAgent] Map-Reduce chunk failed: {e}")
+                return f"Error processing chunk: {e}"
 
+        # Use ThreadPoolExecutor for concurrency
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(process_chunk, chunks))
 
@@ -1737,7 +1744,7 @@ class RecursiveAgent:
         return final_response['llm_response']
 
     def mutate_context(self, instruction):
-        """ Strategy 3: Dynamic Context Mutation """
+        """ Strategy 3: Dynamic Context Mutation - Rewriting the full context. """
         if self.verbose:
             logger.info(f"[RecursiveAgent] Mutating Context: {instruction}")
 
@@ -1761,12 +1768,87 @@ class RecursiveAgent:
         except Exception as e:
             logger.info(f"[RecursiveAgent] Context Mutation Failed: {e}")
 
-    def run(self, task, initial_context=None):
+    def update_context_granular(self, key, value, operation="set"):
+        """ Granular Context Mutation: set or delete specific keys. """
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Granular Update: {operation} key='{key}'")
+
+        if operation == "set":
+            self.context[key] = value
+        elif operation == "delete":
+            if key in self.context:
+                del self.context[key]
+
+    def spawn_sub_agent(self, task, context_keys):
+        """ Spawns a new RecursiveAgent for a sub-task. """
+        if self.recursion_depth >= 3:
+            logger.warning("[RecursiveAgent] Max recursion depth reached. Cannot spawn sub-agent.")
+            return "Error: Max recursion depth reached."
+
+        if self.verbose:
+            logger.info(f"[RecursiveAgent] Spawning Sub-Agent (Depth {self.recursion_depth + 1}): task='{task}', keys={context_keys}")
+
+        sub_context = {k: self.context[k] for k in context_keys if k in self.context}
+
+        # Instantiate sub-agent with same configuration but incremented depth
+        sub_agent = RecursiveAgent(
+            self.library,
+            self.controller_model,
+            reader_model=self.reader_model,
+            embedding_model=self.embedding_model,
+            verbose=self.verbose,
+            recursion_depth=self.recursion_depth + 1
+        )
+
+        return sub_agent.run(task, initial_context=sub_context)
+
+    def _parse_args_robust(self, args_str):
+        """
+        Robust argument parsing handling quotes, commas within quotes, newlines, and JSON blocks.
+        Returns a list of parsed arguments.
+        """
+        args = []
+        current_arg = []
+        in_quote = False
+        quote_char = None
+        escape = False
+
+        for char in args_str:
+            if escape:
+                current_arg.append(char)
+                escape = False
+                continue
+
+            if char == '\\':
+                escape = True
+                continue
+
+            if in_quote:
+                if char == quote_char:
+                    in_quote = False
+                    quote_char = None
+                else:
+                    current_arg.append(char)
+            else:
+                if char in ['"', "'"]:
+                    in_quote = True
+                    quote_char = char
+                elif char == ',':
+                    args.append("".join(current_arg).strip())
+                    current_arg = []
+                else:
+                    current_arg.append(char)
+
+        if current_arg:
+            args.append("".join(current_arg).strip())
+
+        return args
+
+    def run(self, task, initial_context=None, max_steps=10):
         """ Main Loop (Controller) """
         if initial_context:
             self.context = initial_context
 
-        max_steps = 10
         step = 0
 
         while step < max_steps:
@@ -1778,11 +1860,14 @@ class RecursiveAgent:
                 f"Task: {task}\n"
                 f"Current Context Keys: {context_keys}\n"
                 f"Available Tools:\n"
-                f"1. PEEK(query) - Search for information.\n"
-                f"2. MAP_REDUCE(sub_task, list_key) - Process a list of items in parallel.\n"
-                f"3. MUTATE(instruction) - Edit context memory.\n"
-                f"4. ANSWER(text) - Final answer.\n"
-                f"Respond with a single tool call."
+                f"1. PEEK(query) - Semantic search for information.\n"
+                f"2. MAP_REDUCE(sub_task, list_key) - Parallel processing of a list.\n"
+                f"3. SET(key, value) - Store or update a value in context.\n"
+                f"4. DELETE(key) - Remove a key from context.\n"
+                f"5. SUB_AGENT(task, key1, key2...) - Spawn recursive agent with specific context keys.\n"
+                f"6. MUTATE(instruction) - Rewrite or optimize context memory.\n"
+                f"7. ANSWER(text) - Final answer.\n"
+                f"Respond with a single tool call command."
             )
 
             response = self.controller.prompt_main(prompt)['llm_response'].strip()
@@ -1791,42 +1876,60 @@ class RecursiveAgent:
 
             if response.startswith("ANSWER"):
                 if "(" in response and response.endswith(")"):
+                     # Simple parsing for single argument answer
                      return response.split("(", 1)[1].rsplit(")", 1)[0].strip('"\'')
                 return response
 
             # Parse and Execute
-            match = re.match(r"(\w+)\s*\((.*)\)", response, re.DOTALL)
+            # Use search instead of match to be more robust to chatty models
+            match = re.search(r"(\w+)\s*\((.*)\)", response, re.DOTALL)
             if match:
-                cmd, args = match.groups()
-                args = args.strip()
+                cmd, args_str = match.groups()
+                args = self._parse_args_robust(args_str)
 
                 if cmd == "PEEK":
-                    # Neural Peek
-                    query = args.strip('"').strip("'")
-                    chunks = self.neural_peek(query)
-                    self.context[f"peek_{step}"] = chunks # Store results
+                    if args:
+                        query = args[0]
+                        chunks = self.neural_peek(query)
+                        self.context[f"peek_step_{step}"] = chunks
 
                 elif cmd == "MAP_REDUCE":
-                    # Parse args: "sub_task", "list_key"
-                    parts = [p.strip().strip('"').strip("'") for p in args.split(",")]
-                    if len(parts) >= 2:
-                        sub_task = parts[0]
-                        list_key = parts[1]
+                    if len(args) >= 2:
+                        sub_task = args[0]
+                        list_key = args[1]
 
                         if list_key in self.context and isinstance(self.context[list_key], list):
                             result = self.map_reduce(sub_task, self.context[list_key])
-                            self.context[f"map_reduce_{step}"] = result
+                            self.context[f"map_reduce_step_{step}"] = result
                         else:
-                            logger.info(f"[RecursiveAgent] Key {list_key} not found or not a list.")
-                    else:
-                         logger.info(f"[RecursiveAgent] MAP_REDUCE requires 2 arguments.")
+                            logger.info(f"[RecursiveAgent] MAP_REDUCE: Key {list_key} not found or not a list.")
+
+                elif cmd == "SET":
+                    if len(args) >= 2:
+                        key = args[0]
+                        value = args[1]
+                        self.update_context_granular(key, value, "set")
+
+                elif cmd == "DELETE":
+                    if len(args) >= 1:
+                        key = args[0]
+                        self.update_context_granular(key, None, "delete")
+
+                elif cmd == "SUB_AGENT":
+                    if len(args) >= 2:
+                        sub_task = args[0]
+                        keys_to_pass = args[1:]
+                        result = self.spawn_sub_agent(sub_task, keys_to_pass)
+                        self.context[f"sub_agent_step_{step}"] = result
 
                 elif cmd == "MUTATE":
-                    instruction = args.strip('"').strip("'")
-                    self.mutate_context(instruction)
+                    # Backwards compatibility / full rewrite strategy
+                    if args:
+                        instruction = args[0]
+                        self.mutate_context(instruction)
             else:
                 if self.verbose:
-                    logger.info(f"[RecursiveAgent] Unrecognized command format.")
+                    logger.info(f"[RecursiveAgent] Unrecognized command format: {response}")
 
         return "Max steps reached."
 

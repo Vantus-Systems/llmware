@@ -80,26 +80,42 @@ class TestRecursiveAgent(unittest.TestCase):
         # Ensure prompt_main called 3 times
         self.assertEqual(self.mock_prompt_instance.prompt_main.call_count, 3)
 
-    def test_mutate_context(self):
+    def test_update_context_granular(self):
         agent = RecursiveAgent(library="test_lib", controller_model="controller")
-        agent.context = {"key": "old_value"}
+        agent.context = {"key1": "val1"}
 
-        # Mock controller response with new JSON
-        self.mock_prompt_instance.prompt_main.return_value = {
-            "llm_response": '{"key": "new_value", "new_key": "data"}'
-        }
+        agent.update_context_granular("key2", "val2", "set")
+        self.assertEqual(agent.context["key2"], "val2")
 
-        agent.mutate_context("update key")
-        self.assertEqual(agent.context, {"key": "new_value", "new_key": "data"})
+        agent.update_context_granular("key1", None, "delete")
+        self.assertTrue("key1" not in agent.context)
 
-    def test_run_flow(self):
+    def test_parse_args_robust(self):
+        agent = RecursiveAgent(library="test_lib", controller_model="controller")
+
+        # Test 1: Simple args
+        args = agent._parse_args_robust('arg1, "arg 2"')
+        self.assertEqual(args, ['arg1', 'arg 2'])
+
+        # Test 2: Comma inside quotes
+        args = agent._parse_args_robust('"val, with, comma", val2')
+        self.assertEqual(args, ['val, with, comma', 'val2'])
+
+        # Test 3: Newlines and JSON-like with escaped quotes
+        # Input simulates: key, "{\n \"json\": \"val\" \n}"
+        args = agent._parse_args_robust('key, "{\n \\"json\\": \\"val\\" \n}"')
+        self.assertEqual(args, ['key', '{\n "json": "val" \n}'])
+
+    def test_run_flow_advanced(self):
         agent = RecursiveAgent(library="test_lib", controller_model="controller")
 
         # Sequence of controller responses:
         # 1. PEEK("what is X")
-        # 2. ANSWER("It is Y")
+        # 2. SET("status", "found")
+        # 3. ANSWER("It is Y")
         self.mock_prompt_instance.prompt_main.side_effect = [
             {"llm_response": 'PEEK("what is X")'},
+            {"llm_response": 'SET("status", "found")'},
             {"llm_response": 'ANSWER("It is Y")'}
         ]
 
@@ -108,12 +124,12 @@ class TestRecursiveAgent(unittest.TestCase):
 
         response = agent.run("find X")
 
-        # With improved parsing: strip('"\'')
         self.assertEqual(response, "It is Y")
 
-        # Verify context updated with peek result
-        self.assertTrue("peek_1" in agent.context)
-        self.assertEqual(agent.context["peek_1"], ["X is Y"])
+        # Verify context updated with peek result and status
+        self.assertTrue("peek_step_1" in agent.context)
+        self.assertEqual(agent.context["peek_step_1"], ["X is Y"])
+        self.assertEqual(agent.context["status"], "found")
 
 if __name__ == '__main__':
     unittest.main()
